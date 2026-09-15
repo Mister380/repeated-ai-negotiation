@@ -180,13 +180,23 @@ class Runner:
         inst = Instrument(run.instrument)
         prev: Optional[P.EpisodeResult] = None
         status = "complete"
+        is_placebo = run.component == "placebo_pilot"
         for e in range(1, run.episodes + 1):
             episode_id = "{}-e{}".format(run.run_id, e)
-            record = P.build_memory_record(prev) if (run.regime in C.MEMORY_REGIMES and prev is not None) else None
+            history_is_placebo = is_placebo and prev is not None
+            if history_is_placebo:
+                # Placebo-history pilot (edit-plan P3 item 10): episodes 2-4 get a fixed, unrelated donor
+                # record instead of this trajectory's own previous episode. Pilot-only; excluded from
+                # confirmatory analysis (analysis.full_report filters to component main/extension).
+                record = P.PLACEBO_DONOR_RECORD
+            elif run.regime in C.MEMORY_REGIMES and prev is not None:
+                record = P.build_memory_record(prev)
+            else:
+                record = None
             histories = {"BUYER": record, "SUPPLIER": record}
             counter = {"n": 0}
             res = P.run_episode(episode_id, run.regime, e, run.first_mover(e),
-                                {}, histories, inst, self._call(run, episode_id, counter))
+                                {}, histories, inst, self._call(run, episode_id, counter), run.prompt_variant)
             bu, su = P.episode_utilities(res, inst)
             self.episodes.append({
                 "batch": self.batch, "protocol_version": C.PROTOCOL_VERSION, **dataclasses.asdict(run),
@@ -196,7 +206,8 @@ class Runner:
                 "accepted_package": res.accepted.package if res.accepted else None,
                 "offers": [dataclasses.asdict(o) for o in res.offers],
                 "turns": [dataclasses.asdict(t) for t in res.turns],
-                "history_given": record, "buyer_utility": bu if res.outcome != "TECHNICAL_MISSING" else None,
+                "history_given": record, "history_is_placebo": history_is_placebo,
+                "buyer_utility": bu if res.outcome != "TECHNICAL_MISSING" else None,
                 "supplier_utility": su if res.outcome != "TECHNICAL_MISSING" else None,
             })
             if res.outcome == "TECHNICAL_MISSING":

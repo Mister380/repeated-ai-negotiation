@@ -33,9 +33,13 @@ def mock_policy(seed=7):
     def policy(spec, prompt):
         inst = Instrument("robustness" if "| sla | PREMIUM (99.9% availability and 1-hour response) | 40 |" in prompt
                           or "| sla | BASIC (99.0% availability and 8-hour response) | 10 |" in prompt else "main")
-        role = "BUYER" if prompt.startswith("You represent BUYER") else "SUPPLIER"
+        # Role and remaining-message count are read positionally so this works for any INSTRUCTION_VARIANTS
+        # wording (canonical or paraphrase_v1): the instruction paragraph comes first in the prompt and is
+        # the only place BUYER/SUPPLIER and the remaining-count appear before the transcript.
+        idx_b, idx_s = prompt.find("BUYER"), prompt.find("SUPPLIER")
+        role = "BUYER" if idx_b != -1 and (idx_s == -1 or idx_b < idx_s) else "SUPPLIER"
         eid = re.search(r"Episode identifier: (\S+)", prompt).group(1)
-        remaining = int(re.search(r"You have (\d+) messages left", prompt).group(1))
+        remaining = int(re.search(r"(\d+)\s+(?:messages left|of them left)", prompt).group(1))
         n = C.MAX_MESSAGES - remaining + 1
         other = "SUPPLIER" if role == "BUYER" else "BUYER"
         offers = re.findall(r"\] " + other + r" (\{.*\"action\": \"OFFER\".*\})", prompt)
@@ -78,7 +82,9 @@ def main(argv=None):
                           "extension_episodes": S.count_episodes(runs, "extension"),
                           "total_episodes": S.count_episodes(runs), "independent_runs": len(runs),
                           "pilot_episodes": S.count_episodes(pilot, "pilot"),
-                          "robustness_pilot_episodes": S.count_episodes(pilot, "robustness_pilot")}, indent=2))
+                          "robustness_pilot_episodes": S.count_episodes(pilot, "robustness_pilot"),
+                          "placebo_pilot_episodes": S.count_episodes(pilot, "placebo_pilot"),
+                          "paraphrase_pilot_episodes": S.count_episodes(pilot, "paraphrase_pilot")}, indent=2))
         return
 
     if a.command == "feasibility":
@@ -115,7 +121,8 @@ def main(argv=None):
         rows = A.episode_table(eps)
         A.write_csv(rows, os.path.join(batch_dir, "episode_table.csv"))
         A.write_csv(A.secondary_by_cell(rows), os.path.join(batch_dir, "cells.csv"))
-        out = {"pilot_gate": A.pilot_gate([r for r in rows if r["component"] in ("pilot", "robustness_pilot")])}
+        pilot_components = ("pilot", "robustness_pilot", "placebo_pilot", "paraphrase_pilot")
+        out = {"pilot_gate": A.pilot_gate([r for r in rows if r["component"] in pilot_components])}
         if not is_pilot or a.command == "dry-run":
             out["report"] = A.full_report([e for e in eps if e["component"] in ("main", "extension")])
         with open(os.path.join(batch_dir, "report.json"), "w") as f:

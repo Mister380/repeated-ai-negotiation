@@ -12,7 +12,7 @@ from . import config as C
 @dataclass(frozen=True)
 class Run:
     run_id: str
-    component: str      # main | extension | pilot | robustness_pilot | feasibility
+    component: str      # main | extension | pilot | robustness_pilot | placebo_pilot | paraphrase_pilot | feasibility
     pair: str           # "anchor|counterpart"
     anchor: str
     counterpart: str
@@ -22,6 +22,7 @@ class Run:
     initial_mover: str
     replicate: int
     instrument: str = "main"
+    prompt_variant: str = "canonical"  # canonical | paraphrase_v1 (Appendix C paraphrase-robustness pilot)
 
     @property
     def episodes(self) -> int:
@@ -60,8 +61,14 @@ def build_schedule(design: str = "six_provider", seed: int = C.SCHEDULE_SEED) ->
 
 
 def build_pilot(design: str = "six_provider", seed: int = C.SCHEDULE_SEED) -> List[Run]:
-    """One run of every main pair-regime combination (68 episodes), blocks rotated; plus the
-    pilot-only robustness check: one pair repeats D1 under the second payoff table."""
+    """One run of every main pair-regime combination (68 episodes), blocks rotated; plus three pilot-only
+    add-ons that never enter confirmatory analysis (edit-plan-2026-09-15.md P3 items 10 & 12):
+    - robustness_pilot: one pair repeats D1 under the second payoff table;
+    - placebo_pilot: one D1-shaped trajectory for one main pair whose episodes 2-4 receive a fixed,
+      structurally identical memory record from an unrelated donor trajectory instead of their own
+      previous episode (Akata et al. 2025 NHB memory-vs-context confound check);
+    - paraphrase_pilot: one D1 trajectory for one main pair run under a single reworded shared instruction
+      (Sclar et al. 2024 ICLR paraphrase-robustness check)."""
     main_pairs, _ = C.design(design)
     runs = []
     k = 0
@@ -74,6 +81,11 @@ def build_pilot(design: str = "six_provider", seed: int = C.SCHEDULE_SEED) -> Li
     a, c = main_pairs[1] if len(main_pairs) > 1 else main_pairs[0]
     runs.append(Run("robustness-{}-{}-D1".format(a, c), "robustness_pilot", a + "|" + c, a, c, "D1", 0,
                     "BUYER", "BUYER", 0, instrument="robustness"))
+    ap, cp0 = main_pairs[0]
+    runs.append(Run("placebo-{}-{}-D1".format(ap, cp0), "placebo_pilot", ap + "|" + cp0, ap, cp0, "D1", 0,
+                    "BUYER", "BUYER", 0))
+    runs.append(Run("paraphrase-{}-{}-D1".format(ap, cp0), "paraphrase_pilot", ap + "|" + cp0, ap, cp0, "D1", 0,
+                    "BUYER", "BUYER", 0, prompt_variant="paraphrase_v1"))
     random.Random(seed + 1).shuffle(runs)
     return runs
 
