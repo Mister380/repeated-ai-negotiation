@@ -45,10 +45,3 @@ python3 -m negotiation_eval analyze --batch main-v1
 - Trajectory = unit; D1−D0 on mean surplus of episodes 2–4, equal pair and block weights; stratified
   bootstrap (5,000) within pair × regime × block; −10/50 missing-episode bounds.
 - Feasibility traces live under `ADMINISTRATIVE_feasibility_not_data/`; `analyze` refuses them.
-
-## Before the first paid call (open items)
-
-1. Confirm frontier prices (Opus, Haiku, GPT-5.5, Luna are `None` in `config.py`, so paid runs are refused).
-2. Verify the API parameter names for reasoning/effort per provider during the feasibility check.
-3. Kimi K3 and GLM-5.3 show no dated identifier; the feasibility report records this.
-4. Robustness-table surplus bounds differ (−20 to 60); it is pilot-only and not in confirmatory analysis.
