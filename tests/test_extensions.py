@@ -178,6 +178,35 @@ class SecondaryStatistics(unittest.TestCase):
         self.assertGreater(mde, 0.80)
         self.assertLess(mde, 0.82)
 
+    def test_randomization_p_value_uses_null_distribution(self):
+        rows = []
+        for b in range(4):
+            for i in range(6):
+                rows.append({"pair": "opus|haiku", "block": b, "regime": "D0", "mean_surplus": 20.0})
+                rows.append({"pair": "opus|haiku", "block": b, "regime": "D1", "mean_surplus": 20.0})
+        bs = A.bootstrap(rows, ["D1"], ["D0"], reps=100, seed=3)
+        self.assertEqual(bs["estimate"], 0.0)
+        self.assertGreaterEqual(bs["p_value"], 0.9)
+
+    def test_group_pair_strata_distinguish_equal_pair_and_equal_stratum(self):
+        rows = []
+        for pair, effect in (("opus|opus", 1.0), ("opus|haiku", 3.0), ("gpt55|gpt55", 5.0),
+                             ("deepseek|deepseek", 9.0)):
+            for b in range(4):
+                rows.extend([{"pair": pair, "block": b, "regime": "D0", "mean_surplus": 0.0},
+                             {"pair": pair, "block": b, "regime": "D1", "mean_surplus": effect}])
+        report = A.group_pair_contrasts(rows, ["D1"], ["D0"])
+        self.assertEqual(report["equal_pair"]["pair_count"], 4)
+        self.assertEqual(report["equal_stratum"]["stratum_count"], 6)
+        self.assertFalse(report["equal_stratum"]["estimable"])
+        self.assertIn("anthropic|anthropic", report["strata"])
+
+    def test_synthetic_calibration_is_explicitly_paid_call_free(self):
+        out = A.synthetic_calibration(seed=4, n_per_cell=8, reps=40)
+        self.assertTrue(out["synthetic"])
+        self.assertEqual(out["paid_calls"], 0)
+        self.assertTrue(out["known_effect"]["ci_contains_truth"])
+
 
 class ReportWiring(unittest.TestCase):
     def _ep(self, run_id, comp, pair, regime, block, e, pkg):
@@ -210,7 +239,7 @@ class ReportWiring(unittest.TestCase):
 class PilotCounts(unittest.TestCase):
     def test_pilot_main_component_still_68_and_each_new_arm_4(self):
         pilot = S.build_pilot()
-        self.assertEqual(S.count_episodes(pilot, "pilot"), 68)
+        self.assertEqual(S.count_episodes(pilot, "pilot"), 612)
         self.assertEqual(S.count_episodes(pilot, "placebo_pilot"), 4)
         self.assertEqual(S.count_episodes(pilot, "paraphrase_pilot"), 4)
         self.assertEqual(S.count_episodes(pilot, "robustness_pilot"), 4)

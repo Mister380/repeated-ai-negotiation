@@ -1,65 +1,34 @@
-# negotiation_eval — experiment harness for the ESSEC dissertation
+# negotiation_eval
 
-Implements the protocol fixed in Deliverable 1 and the Deliverable 2 methodology proposal
-(`../Deliverable 2/methodology-proposal-v2.md`, `proposal-appendices.md`). Python 3.9+, standard library only.
+This folder contains the reproducible evaluation harness for the ESSEC repeated cross-model negotiation study. It uses a fixed five-issue payoff instrument, a referee-driven JSON action protocol, fresh request contexts, and append-only JSONL archives.
 
-| Proposal section | Module |
-| --- | --- |
-| Appendix A: 5-issue payoff instrument, outside option 40, pilot-only robustness table | `instrument.py` |
-| Appendix B: action schema, referee, prompts, disclosure, memory record, state machine | `protocol.py` |
-| Appendix C: roster (six providers), pairs, fallback, blocks, seeds, caps, retries | `config.py`, `schedule.py` |
-| §3.6 / App. C: fresh contexts, JSONL archive, retries, version freeze, budget gate | `runner.py`, `providers.py` |
-| Supervisor D-2026-09-12-002: technical feasibility check (administrative, excluded) + contamination probe | `feasibility.py` |
-| §4 / Appendix D: outcomes, concessions, D1−D0 primary, bootstrap, interaction, bounds, pilot gate | `analysis.py` |
-| App. C P3 pilot add-ons: placebo-history + paraphrase-robustness arms | `protocol.py`, `schedule.py`, `runner.py` |
-| App. D P3 secondaries: BH q-values, Wilson intervals, bootstrap coverage, a-priori MDE, anchoring, repeat rate | `analysis.py` |
+The confirmatory design has eight candidate model labels and all 36 unordered model pairings, including self-pairings. Every pair is run in all five regimes (`S`, `D0`, `D1`, `U0`, `U1`) with 24 independent trajectories per pair/regime. The four role and first-mover blocks are balanced at six trajectories each. This is 4,320 independent trajectories and 14,688 episodes. The default design label is `three_group`; `six_provider` is accepted as a compatibility alias for the same all-pairs schedule.
 
-## Commands (run from this folder)
+The three analysis groups are Anthropic, OpenAI, and `open_weight`. The last name is a design stratum only and does not attest to a model's licence or weight availability. Candidate API identifiers are recorded as unverified until the administrative feasibility check confirms the returned version. No model or provider name enters a negotiation prompt: public episode identifiers are opaque hashes, and the payoff table contains only the acting side's points.
+
+The primary estimand is the D1−D0 difference in mean joint surplus over episodes 2–4, with the trajectory as the independent unit. It gives every unordered model pair equal weight and every block equal weight within pair. Technical missingness is kept separate from substantive disagreement; complete-case estimates are accompanied by bounds that fill every missing scheduled episode with the instrument's −10 to 50 surplus range. A percentile bootstrap supplies intervals. Exploratory D1−D0 p-values use within-pair/block label randomization under a sharp exchangeability null; the factorial interaction and D0/S and D1/S comparisons remain descriptive because their nulls require different treatment of the repeated episode aggregation. Secondary results include the six group-pair strata, with an equal-stratum sensitivity that is explicitly unestimable when any required stratum is absent.
+
+Repeated-episode rates use run-clustered bootstrap intervals. Wilson intervals are reserved for independent one-episode cells. Pilot-only placebo-history, paraphrase, and robustness arms are archived and gated separately; they never enter the confirmatory report. Feasibility traces are administrative and are refused by the analysis command.
+
+Useful no-call checks from this folder:
 
 ```bash
-python3 -m unittest discover -s tests -t .        # 43 pre-pilot unit checks (Appendix C)
-python3 -m negotiation_eval check-instrument       # 243 / 90 IR / 15 Pareto / joint 70-130
-python3 -m negotiation_eval schedule               # 1,632 + 192 = 1,824 episodes; 528 runs; pilot 68
-python3 -m negotiation_eval schedule --design fallback
-python3 -m negotiation_eval dry-run --out /tmp/dry --limit 528   # whole pipeline on a mock, no cost
-
-# real calls (keys from env: ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)
-python3 -m negotiation_eval feasibility --budget-usd 5
-python3 -m negotiation_eval pilot --budget-usd 60
-python3 -m negotiation_eval analyze --batch pilot-v1 --pilot
-python3 -m negotiation_eval run --batch main-v1 --budget-usd <institutional ceiling>
-python3 -m negotiation_eval analyze --batch main-v1
+python3 -m unittest discover -s tests -t .
+python3 -m negotiation_eval check-instrument
+python3 -m negotiation_eval schedule
+python3 -m negotiation_eval simulate --seed 20260912 --reps 500
+python3 -m negotiation_eval dry-run --out /tmp/negotiation-eval-dry --limit 40
 ```
 
-## Guarantees encoded (and tested)
+`simulate` is a deterministic synthetic calibration. It makes no network or paid calls and reports a known-null contrast, a known-effect confidence-interval check, an explicit missingness-bound example, and 100 independent synthetic experiments reporting null rejection and interval coverage with Monte Carlo uncertainty. A single interval can miss the true effect; these diagnostics do not establish power for real model outcomes. `dry-run` exercises the archive, referee, memory, and report wiring with the mock provider.
 
-- Only the acting side's payoff column enters a prompt; no brand, regime or hypothesis label.
-- Non-treatment prompt text is identical across S/D0/D1/U0/U1; U regimes carry no encounter sentence.
-- Memory (D1/U1, episodes 2–4) = code-generated factual record of the previous episode only; no utilities.
-- Invalid actions consume a turn, are hidden from the counterpart, and are logged; no coaching or repair.
-- Acceptance must reference the counterpart's most recent valid offer; a message-10 offer cannot be accepted.
-- Reservation violations are recorded, never prevented.
-- Two identical retries (5 s, 15 s) then technical missingness; the trajectory stops, no invented memory,
-  no replacement runs.
-- A changed returned model version stops collection; input > 8,000 tokens is a protocol failure.
-- No paid call without `--budget-usd`; a whole run's worst-case cost is reserved before it starts; models
-  with unconfirmed prices are refused.
-- Trajectory = unit; D1−D0 on mean surplus of episodes 2–4, equal pair and block weights; stratified
-  ("percentile") bootstrap (5,000) within pair × regime × block; −10/50 missing-episode bounds.
-- Feasibility traces live under `ADMINISTRATIVE_feasibility_not_data/`; `analyze` refuses them.
-- Feasibility also runs one contamination probe per model (Golchin & Surdeanu 2024; Sainz et al. 2023):
-  the model is asked to continue the first two sentences of the case text verbatim; the response is scored
-  against the hidden remainder (token overlap, longest common word n-gram). Administrative signal only,
-  never a claim that a model has or has not seen the case.
-- Pilot-only add-ons (never in the confirmatory report, always in `pilot_gate`): `placebo_pilot` — one
-  D1-shaped trajectory whose episodes 2–4 get a fixed, structurally identical memory record from an
-  unrelated seeded donor trajectory instead of their own previous episode (Akata et al. 2025 NHB
-  memory-vs-context confound check); `paraphrase_pilot` — one D1 trajectory run under a single reworded
-  shared instruction (`prompt_variant="paraphrase_v1"`, same rules and numbers; Sclar et al. 2024 ICLR).
-- Exploratory secondary family (pair-specific D1−D0, interaction, D0−S, D1−S) reported with two-sided
-  bootstrap p-values and one shared Benjamini–Hochberg pass; cell-level agreement/IR rates carry Wilson 95%
-  intervals; `bootstrap_coverage()` simulates empirical CI coverage at an assumed pilot SD; `mde_sd_units()`
-  gives the a-priori minimum detectable effect (≈0.81 SD at n=24, 80% power, α=.05), independent of any
-  pilot SD estimate.
-- Prior-package repeat rate (lock-in vs renewed search) and first-offer-vs-final-price Spearman anchoring
-  correlation are reported per cell (App. D secondaries; stdlib-only rank correlation, ties averaged).
+The main modules are:
+
+| Module | Responsibility |
+| --- | --- |
+| `config.py` | roster, six group-pair strata, regimes, caps, and seeds |
+| `schedule.py` | all-pairs schedule, balanced blocks, pilot additions, and invariant checks |
+| `protocol.py` | action schema, prompt assembly, referee, memory record, and state machine |
+| `runner.py` | provider calls, retries, version freeze, spend controls, and archived manifest |
+| `analysis.py` | outcome table, trajectory summaries, primary contrast, sensitivity bounds, bootstrap, randomization, and report |
+| `feasibility.py` | administrative access/version/schema check and contamination probe |

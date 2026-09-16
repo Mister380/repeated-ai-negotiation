@@ -1,11 +1,12 @@
 """Command line entry point.
 
   python -m negotiation_eval check-instrument
-  python -m negotiation_eval schedule   [--design six_provider|fallback] [--out runs/]
+  python -m negotiation_eval schedule   [--design three_group|fallback] [--out runs/]
   python -m negotiation_eval feasibility --models opus,haiku,gpt55,luna,deepseek,qwen,kimi,glm --budget-usd 5
   python -m negotiation_eval pilot      --budget-usd 60 [--design ...]
   python -m negotiation_eval run        --budget-usd 1200 --batch main-v1 [--design ...] [--limit N]
   python -m negotiation_eval analyze    --batch main-v1 [--pilot]
+  python -m negotiation_eval simulate   (deterministic synthetic calibration; no network, no cost)
   python -m negotiation_eval dry-run    (full pipeline on a mock provider, no network, no cost)
 """
 from __future__ import annotations
@@ -58,18 +59,24 @@ def mock_policy(seed=7):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="negotiation_eval")
     ap.add_argument("command", choices=["check-instrument", "schedule", "feasibility", "pilot", "run", "analyze",
-                                        "dry-run"])
-    ap.add_argument("--design", default="six_provider", choices=["six_provider", "fallback"])
+                                        "simulate", "dry-run"])
+    ap.add_argument("--design", default="three_group", choices=["three_group", "six_provider", "fallback"])
     ap.add_argument("--out", default="data")
     ap.add_argument("--batch", default=None)
     ap.add_argument("--budget-usd", type=float, default=None)
     ap.add_argument("--models", default=",".join(C.MODELS))
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--pilot", action="store_true", help="analyze: apply pilot gate instead of confirmatory report")
+    ap.add_argument("--seed", type=int, default=C.BOOTSTRAP_SEED, help="simulate: deterministic synthetic seed")
+    ap.add_argument("--reps", type=int, default=500, help="simulate: calibration resamples")
     a = ap.parse_args(argv)
 
     if a.command == "check-instrument":
         print(json.dumps({n: Instrument(n).enumerate_properties() for n in ("main", "robustness")}, indent=2))
+        return
+
+    if a.command == "simulate":
+        print(json.dumps(A.synthetic_calibration(seed=a.seed, reps=a.reps), indent=2))
         return
 
     if a.command == "schedule":
@@ -106,7 +113,7 @@ def main(argv=None):
             runs = S.build_pilot(a.design) if a.command == "pilot" else S.build_schedule(a.design)
             if a.limit:
                 runs = runs[: a.limit]
-        result = Runner(a.out, batch, providers, a.budget_usd).execute(runs)
+        result = Runner(a.out, batch, providers, a.budget_usd, planned_runs=runs).execute(runs)
         print(json.dumps(result, indent=2))
         if a.command != "dry-run":
             return
@@ -114,7 +121,8 @@ def main(argv=None):
 
     if a.command in ("analyze", "dry-run"):
         batch_dir = os.path.join(a.out, a.batch)
-        eps = [json.loads(l) for l in open(os.path.join(batch_dir, "episodes.jsonl")) if l.strip()]
+        with open(os.path.join(batch_dir, "episodes.jsonl"), encoding="utf-8") as src:
+            eps = [json.loads(l) for l in src if l.strip()]
         if any(e["component"] == "feasibility" for e in eps):
             raise SystemExit("Refusing: feasibility traces are administrative and excluded from analysis")
         is_pilot = a.pilot or a.command == "dry-run" or a.batch.startswith("pilot")
@@ -124,7 +132,15 @@ def main(argv=None):
         pilot_components = ("pilot", "robustness_pilot", "placebo_pilot", "paraphrase_pilot")
         out = {"pilot_gate": A.pilot_gate([r for r in rows if r["component"] in pilot_components])}
         if not is_pilot or a.command == "dry-run":
-            out["report"] = A.full_report([e for e in eps if e["component"] in ("main", "extension")])
+            planned = None
+            manifest_path = os.path.join(batch_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                with open(manifest_path, encoding="utf-8") as src:
+                    manifest = json.load(src)
+                planned_ids = set(manifest.get("planned_schedule", {}).get("run_ids", []))
+                if planned_ids:
+                    planned = [r for r in S.build_schedule(a.design) if r.run_id in planned_ids]
+            out["report"] = A.full_report([e for e in eps if e["component"] in ("main", "extension")], planned)
         with open(os.path.join(batch_dir, "report.json"), "w") as f:
             json.dump(out, f, indent=2, default=str)
         print(json.dumps(out, indent=2, default=str)[:4000])

@@ -146,6 +146,29 @@ class Prompts(unittest.TestCase):
         p = P.render_prompt("BUYER", "U1", 3, "e", 10, None, [], INST)
         self.assertNotIn("encounter", p)
 
+    def test_public_episode_identifier_does_not_leak_model_or_regime(self):
+        from negotiation_eval.runner import sha256
+        run = S.Run("main-opus-haiku-D1", "main", "opus|haiku", "opus", "haiku", "D1", 0,
+                    "BUYER", "BUYER", 0)
+        public_id = "episode-{}".format(sha256("{}:1".format(run.run_id))[:16])
+        prompt = P.render_prompt("BUYER", "D1", 1, public_id, 10, None, [], INST)
+        self.assertNotIn("opus", prompt.lower())
+        self.assertNotIn("haiku", prompt.lower())
+        self.assertNotIn("D1", prompt)
+        self.assertNotIn("-e1", prompt)
+
+    def test_runner_uses_opaque_ids_in_undisclosed_prompts(self):
+        with tempfile.TemporaryDirectory() as d:
+            mock = MockProvider(mock_policy(9))
+            r = Runner(d, "opaque", {"anthropic": mock, "openai": mock, "openrouter": mock}, None,
+                       sleep=lambda s: None)
+            r.execute_run(S.Run("run-opus-haiku-U1", "main", "opus|haiku", "opus", "haiku", "U1", 0,
+                                "BUYER", "BUYER", 0))
+            prompts = [q["prompt"] for q in r.requests.read() if q.get("phase") == "request_started"]
+            self.assertTrue(prompts)
+            self.assertTrue(all("opus" not in p.lower() and "haiku" not in p.lower() for p in prompts))
+            self.assertTrue(all("-e1" not in p and "-e2" not in p for p in prompts))
+
 
 class Memory(unittest.TestCase):
     def _runner(self, d, policy=None):
@@ -167,7 +190,7 @@ class Memory(unittest.TestCase):
                     self.assertIsNone(e["history_given"])
             reqs = r.requests.read()
             for q in reqs:
-                if q["run_id"] in ("x-D0", "x-U0", "x-S") or q["episode_id"].endswith("e1"):
+                if q["run_id"] in ("x-D0", "x-U0", "x-S") or q.get("episode_no") == 1:
                     self.assertIn("History: none", q["prompt"])
 
     def test_memory_record_is_previous_episode_only_and_factual(self):
@@ -184,7 +207,7 @@ class Memory(unittest.TestCase):
                 self.assertEqual(rec["messages"], len(prev["turns"]))
                 self.assertEqual(rec["accepted_package"], prev["accepted_package"])
                 self.assertNotIn("utility", json.dumps(rec))
-            e2_prompts = [q["prompt"] for q in r.requests.read() if q["episode_id"].endswith("-e2")]
+            e2_prompts = [q["prompt"] for q in r.requests.read() if q.get("episode_no") == 2]
             self.assertTrue(all('History: {"outcome": ' in q for q in e2_prompts))
 
 
@@ -192,14 +215,21 @@ class Schedule(unittest.TestCase):
     def test_counts_match_appendix_c(self):
         runs = S.build_schedule()
         self.assertEqual((S.count_episodes(runs, "main"), S.count_episodes(runs, "extension"), len(runs)),
-                         (1632, 192, 528))
-        self.assertEqual(S.count_episodes(S.build_pilot(), "pilot"), 68)
+                         (14688, 0, 4320))
+        self.assertEqual(S.count_episodes(S.build_pilot(), "pilot"), 612)
 
     def test_fallback_keeps_all_regimes_and_open_weight_only(self):
         runs = S.build_schedule("fallback")
         self.assertEqual(S.count_episodes(runs), 1632)
         self.assertEqual({r.regime for r in runs}, set(C.REGIMES))
         self.assertTrue(all(C.MODELS[m].open_weight for r in runs for m in (r.anchor, r.counterpart)))
+
+    def test_three_group_has_all_unordered_pairs_and_compatibility_alias(self):
+        runs = S.build_schedule("three_group")
+        alias = S.build_schedule("six_provider")
+        self.assertEqual({r.pair for r in runs}, {a + "|" + b for a, b in C.ALL_PAIRS})
+        self.assertEqual([r.run_id for r in runs], [r.run_id for r in alias])
+        self.assertEqual({r.regime for r in runs}, set(C.REGIMES))
 
     def test_blocks_balanced_six_per_cell(self):
         c = Counter((r.pair, r.regime, r.block) for r in S.build_schedule() if r.component == "main")
@@ -213,9 +243,23 @@ class Schedule(unittest.TestCase):
 
 
 class Execution(unittest.TestCase):
+    def test_archive_has_manifest_provenance_and_preflight_event(self):
+        with tempfile.TemporaryDirectory() as d:
+            mock = MockProvider(mock_policy(2))
+            planned = [S.Run("archive", "main", "opus|opus", "opus", "opus", "S", 0, "BUYER", "BUYER", 0)]
+            r = Runner(d, "archive", {"anthropic": mock, "openai": mock, "openrouter": mock}, None,
+                       sleep=lambda s: None, planned_runs=planned)
+            r.execute_run(planned[0])
+            with open(os.path.join(d, "archive", "manifest.json")) as f:
+                manifest = json.load(f)
+            self.assertEqual(manifest["manifest_version"], 2)
+            self.assertEqual(manifest["model_api_ids_status"], "unverified_until_feasibility")
+            self.assertEqual(manifest["planned_schedule"]["run_count"], 1)
+            self.assertIn("request_started", {q["phase"] for q in r.requests.read()})
+
     def test_two_retries_then_trajectory_stops_without_invented_memory(self):
         def policy(spec, prompt):
-            if "-e2" in re.search(r"Episode identifier: (\S+)", prompt).group(1):
+            if "History: {" in prompt:
                 raise InfraError("503")
             return mock_policy(1)(spec, prompt)
         with tempfile.TemporaryDirectory() as d:
@@ -294,6 +338,16 @@ class Analysis(unittest.TestCase):
         self.assertAlmostEqual(b["low"], (50 + 50 - 10) / 3)
         self.assertAlmostEqual(b["high"], 50.0)
         self.assertIsNone(A.contrast(summ, ["D1"], ["D0"]))  # complete-case has no D1 run
+
+    def test_unobserved_planned_run_is_included_in_bounds_denominator(self):
+        observed = [self._ep("d0", "opus|haiku", "D0", 0, e, None) for e in range(1, 5)]
+        planned = [S.Run("d1", "main", "opus|haiku", "opus", "haiku", "D1", 0, "BUYER", "BUYER", 0),
+                   S.Run("d0", "main", "opus|haiku", "opus", "haiku", "D0", 0, "BUYER", "BUYER", 0)]
+        summ = A.run_summaries(A.episode_table(observed), scheduled_runs=planned)
+        self.assertEqual({s["run_id"] for s in summ}, {"d0", "d1"})
+        bounds = A.missing_bounds(summ, ["D1"], ["D0"])
+        self.assertEqual(bounds["incomplete_runs"]["D1"], 1)
+        self.assertEqual(bounds["low"], -10.0)
 
     def test_concession_and_share_definitions(self):
         offers = [{"role": "BUYER", "package": dict(PKG, price=18000)}, {"role": "BUYER", "package": PKG}]

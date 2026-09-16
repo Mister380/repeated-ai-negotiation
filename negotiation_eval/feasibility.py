@@ -128,7 +128,8 @@ def run_check(out_root: str, providers: Dict[str, Provider], models: List[str],
         reqs = [r for r in runner.requests.read() if r["run_id"] == run.run_id]
         eps = [e for e in runner.episodes.read() if e["run_id"] == run.run_id]
         returned = next((r.get("returned_model") for r in reqs if r.get("returned_model")), None)
-        entry["accessed"] = entry["accessed"] and any(r.get("error") is None for r in reqs)
+        entry["accessed"] = entry["accessed"] and any(r.get("phase") == "response" and r.get("error") is None
+                                                        for r in reqs)
         entry["stored_and_reloaded"] = bool(eps) and all("turns" in e for e in eps)
         entry["returned_model"] = returned
         entry["dated_version_id"] = has_dated_id(spec.api_id, returned)

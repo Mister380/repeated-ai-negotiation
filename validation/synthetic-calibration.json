@@ -1,0 +1,45 @@
+{
+  "synthetic": true,
+  "paid_calls": 0,
+  "seed": 20260912,
+  "n_per_cell": 24,
+  "reps": 500,
+  "monte_carlo": {
+    "trials": 100,
+    "null_rejection_rate": 0.06,
+    "null_rejection_mc_interval": [
+      0.027786123963188195,
+      0.12476815445895921
+    ],
+    "effect_interval_coverage": 0.9,
+    "coverage_mc_interval": [
+      0.8256343384950866,
+      0.9447708629393249
+    ],
+    "scope": "Independent normal trajectory summaries, SD 10; diagnostic only, not model power."
+  },
+  "known_null": {
+    "true_effect": 0.0,
+    "estimate": -2.585376296403005,
+    "p_value": 0.3772455089820359
+  },
+  "known_effect": {
+    "true_effect": 5.0,
+    "estimate": 10.533944530599518,
+    "ci_low": 5.259711695692312,
+    "ci_high": 16.560765740082275,
+    "ci_contains_truth": false
+  },
+  "missingness_example": {
+    "missing_rate": 0.1,
+    "bounds": {
+      "low": -30.0,
+      "high": 30.0,
+      "incomplete_runs": {
+        "D1": 1,
+        "D0": 0
+      }
+    },
+    "available_case": 5.860603771927959
+  }
+}

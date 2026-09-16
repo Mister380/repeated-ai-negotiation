@@ -6,11 +6,12 @@ The trajectory (run) is the independent unit; episodes are never treated as inde
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 import random
 from collections import defaultdict
 from statistics import NormalDist
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import config as C
 from .instrument import ISSUES, OUTSIDE_OPTION, Instrument
@@ -35,7 +36,9 @@ def episode_table(episodes: Iterable[Dict]) -> List[Dict]:
             "run_id": ep["run_id"], "component": ep["component"], "pair": ep["pair"], "regime": ep["regime"],
             "block": ep["block"], "episode": ep["episode"], "instrument": inst.name,
             "buyer_model": ep["buyer_model"], "supplier_model": ep["supplier_model"],
+            "outcome": ep["outcome"],
             "technical_missing": int(missing), "agreement": agree,
+            "history_exposure": "factual_record" if ep.get("history_given") is not None else "none",
             "accepted_package": accepted_package,
             "first_offer_price": offers[0]["package"]["price"] if offers else None,
             "final_accepted_price": accepted_package["price"] if accepted_package else None,
@@ -106,27 +109,53 @@ def add_stability(rows: List[Dict]) -> None:
 
 
 # ---------------------------------------------------------------- run summaries
-def run_summaries(rows: List[Dict], first_episode: int = 2) -> List[Dict]:
+def run_summaries(rows: List[Dict], first_episode: int = 2, scheduled_runs: Optional[Sequence] = None) -> List[Dict]:
     """One row per run. Repeated regimes: mean surplus over episodes 2-4; S: its single episode.
     Includes -10/50 bounds when a scheduled episode is unobserved."""
     by_run = defaultdict(list)
     for r in rows:
         by_run[r["run_id"]].append(r)
     out = []
-    for rid, rs in by_run.items():
+    # Include scheduled units that have no episode row (for example, collection
+    # stopped after a provider failure).  They remain missing for sensitivity
+    # bounds instead of silently disappearing from the denominator.
+    targets = [(rid, rs) for rid, rs in by_run.items()]
+    if scheduled_runs is not None:
+        known = set(by_run)
+        for run in scheduled_runs:
+            rid = run.get("run_id") if isinstance(run, dict) else run.run_id
+            if rid in known:
+                continue
+            if isinstance(run, dict):
+                meta = run
+            else:
+                meta = {"run_id": run.run_id, "component": run.component, "pair": run.pair,
+                        "regime": run.regime, "block": run.block, "anchor": run.anchor,
+                        "counterpart": run.counterpart}
+            targets.append((rid, [{"run_id": rid, **meta}]))
+    for rid, rs in targets:
         r0 = rs[0]
         n_eps = C.EPISODES[r0["regime"]]
         wanted = [1] if n_eps == 1 else list(range(first_episode, n_eps + 1))
-        obs = {r["episode"]: r["joint_surplus"] for r in rs if not r["technical_missing"]}
+        obs = {r["episode"]: r["joint_surplus"] for r in rs
+               if r.get("episode") is not None and not r.get("technical_missing", 0)}
         vals = [obs.get(e) for e in wanted]
         complete = all(v is not None for v in vals)
         lo = [v if v is not None else SURPLUS_MIN for v in vals]
         hi = [v if v is not None else SURPLUS_MAX for v in vals]
+        buyer_model = r0.get("buyer_model")
+        supplier_model = r0.get("supplier_model")
+        if buyer_model is None and r0.get("anchor") is not None:
+            anchor_role = r0.get("anchor_role", "BUYER")
+            buyer_model = r0["anchor"] if anchor_role == "BUYER" else r0.get("counterpart")
+            supplier_model = r0.get("counterpart") if anchor_role == "BUYER" else r0["anchor"]
         out.append({"run_id": rid, "component": r0["component"], "pair": r0["pair"], "regime": r0["regime"],
-                    "block": r0["block"], "complete": complete,
+                    "block": r0["block"], "buyer_model": buyer_model, "supplier_model": supplier_model,
+                    "complete": complete, "observed_episodes": sum(v is not None for v in vals),
+                    "scheduled_episodes": len(wanted), "technical_missing_episodes": sum(v is None for v in vals),
                     "mean_surplus": sum(vals) / len(vals) if complete else None,
                     "bound_low": sum(lo) / len(lo), "bound_high": sum(hi) / len(hi),
-                    "agreement_rate": _mean([r["agreement"] for r in rs if r["episode"] in wanted])})
+                    "agreement_rate": _mean([r.get("agreement") for r in rs if r.get("episode") in wanted])})
     return out
 
 
@@ -148,10 +177,12 @@ def contrast(summ: List[Dict], plus: List[str], minus: List[str], value="mean_su
     """Equal-weight average over pair x block strata of (sum of plus cells) - (sum of minus cells).
     D1-D0: plus=[D1], minus=[D0]. Interaction (D1-D0)-(U1-U0): plus=[D1,U0], minus=[D0,U1]."""
     cm = _cell_means(summ, value)
-    strata = {(p, b) for (p, b, _) in cm}
+    strata = {(s["pair"], s["block"]) for s in summ if s["regime"] in plus + minus}
     # equal block weights within pair, then equal pair weights
     by_pair = defaultdict(list)
     for p, b in sorted(strata):
+        if not all((p, b, g) in cm for g in plus + minus):
+            return None  # Never silently change the registered pair/block weights.
         if all((p, b, g) in cm for g in plus + minus):
             by_pair[p].append(sum(cm[(p, b, g)] for g in plus) - sum(cm[(p, b, g)] for g in minus))
     if not by_pair:
@@ -164,17 +195,55 @@ def pair_contrasts(summ, plus, minus, value="mean_surplus") -> Dict[str, Optiona
             for p in sorted({s["pair"] for s in summ})}
 
 
+def group_pair_stratum(pair: str) -> str:
+    """Map a model pair to one of the six unordered design-group strata."""
+    labels = pair.split("|", 1)
+    if len(labels) != 2 or any(label not in C.MODELS for label in labels):
+        return "unknown|unknown"
+    groups = sorted(("open_weight" if C.MODELS[label].open_weight else C.MODELS[label].provider
+                     for label in labels), key=lambda g: C.GROUPS.index(g) if g in C.GROUPS else 99)
+    return "|".join(groups)
+
+
+def group_pair_contrasts(summ: List[Dict], plus, minus, value="mean_surplus") -> Dict:
+    """Report the D1-D0 estimand by six unordered group-pair strata.
+
+    ``equal_pair`` gives every model pair the same weight (the primary
+    estimand).  ``equal_stratum`` averages the six stratum estimates, giving
+    each stratum the same weight regardless of how many model pairs it holds.
+    Within every pair, blocks are equally weighted by :func:`contrast`.
+    """
+    strata = {}
+    for stratum in C.GROUP_PAIR_STRATA:
+        members = [s for s in summ if group_pair_stratum(s["pair"]) == stratum]
+        bs = bootstrap(members, plus, minus, value) if members else {"estimate": None, "ci_low": None,
+                                                                       "ci_high": None, "p_value": None}
+        strata[stratum] = {"pairs": sorted({s["pair"] for s in members}),
+                           "estimate": bs.get("estimate"), "ci_low": bs.get("ci_low"),
+                           "ci_high": bs.get("ci_high"), "p_value": bs.get("p_value")}
+    estimates = [strata[g]["estimate"] for g in C.GROUP_PAIR_STRATA]
+    all_estimable = all(x is not None for x in estimates)
+    return {"equal_pair": {"estimate": contrast(summ, plus, minus, value),
+                            "pair_count": len({s["pair"] for s in summ})},
+            "equal_stratum": {"estimate": sum(estimates) / len(estimates) if all_estimable else None,
+                               "stratum_count": len(C.GROUP_PAIR_STRATA), "estimable": all_estimable},
+            "strata": strata,
+            "weighting_note": "equal_pair is primary; equal_stratum is a six-stratum sensitivity; blocks equal within pair"}
+
+
 def bootstrap(summ: List[Dict], plus, minus, value="mean_surplus", reps=C.BOOTSTRAP_RESAMPLES,
               seed=C.BOOTSTRAP_SEED, alpha=0.05) -> Dict:
     """Percentile stratified bootstrap of whole runs within pair x regime x block (named "percentile" per
-    supervisor-notes G-07). Returns the resample draws (`draws`) so callers can derive two-sided bootstrap
-    p-values without re-resampling (edit-plan P3 item 14)."""
+    supervisor-notes G-07). Returns interval draws separately from sharp-null randomization draws."""
     rng = random.Random(seed)
     strata = defaultdict(list)
     for s in summ:
         if s["regime"] in plus + minus and s[value] is not None:
             strata[(s["pair"], s["regime"], s["block"])].append(s)
     est = contrast(summ, plus, minus, value)
+    if est is None:
+        return {"estimate": None, "ci_low": None, "ci_high": None, "reps": 0,
+                "draws": [], "null_draws": [], "p_value": None}
     draws = []
     for _ in range(reps):
         sample = []
@@ -185,11 +254,57 @@ def bootstrap(summ: List[Dict], plus, minus, value="mean_surplus", reps=C.BOOTST
             draws.append(d)
     draws.sort()
     if not draws:
-        return {"estimate": est, "ci_low": None, "ci_high": None, "reps": 0, "draws": []}
+        return {"estimate": est, "ci_low": None, "ci_high": None, "reps": 0, "draws": [],
+                "null_draws": [], "p_value": None}
     lo = draws[int(math.floor(alpha / 2 * len(draws)))]
     hi = draws[min(len(draws) - 1, int(math.ceil((1 - alpha / 2) * len(draws))) - 1)]
+    null = randomization_test(summ, plus, minus, value=value, reps=reps, seed=seed + 1)
     return {"estimate": est, "ci_low": lo, "ci_high": hi, "reps": len(draws), "draws": draws,
+            "null_draws": null["draws"], "p_value": null["p_value"],
             "n_runs": {g: sum(1 for s in summ if s["regime"] == g and s[value] is not None) for g in plus + minus}}
+
+
+def randomization_test(summ: List[Dict], plus, minus, value="mean_surplus",
+                       reps=C.BOOTSTRAP_RESAMPLES, seed=C.BOOTSTRAP_SEED) -> Dict:
+    """Permutation test under the sharp null within pair x block.
+
+    The prior implementation called tails of an ordinary bootstrap distribution
+    a p-value.  That is not a null distribution and becomes anti-conservative
+    when the observed effect is nonzero.  This test shuffles condition labels
+    within each pair/block while preserving each regime's observed cell size;
+    it is used for exploratory two-sided p-values and is deterministic by seed.
+    """
+    rng = random.Random(seed)
+    est = contrast(summ, plus, minus, value)
+    if len(plus) != 1 or len(minus) != 1 or "S" in plus + minus:
+        return {"estimate": est, "p_value": None, "draws": [], "reps": 0}
+    regimes = list(dict.fromkeys(list(plus) + list(minus)))
+    by_stratum = defaultdict(lambda: defaultdict(list))
+    for s in summ:
+        if s.get("regime") in regimes and s.get(value) is not None:
+            by_stratum[(s["pair"], s["block"])][s["regime"]].append(s[value])
+    if est is None or not by_stratum:
+        return {"estimate": est, "p_value": None, "draws": [], "reps": 0}
+    draws = []
+    for _ in range(reps):
+        sample = []
+        for (pair, block), cells in by_stratum.items():
+            pool = [x for values in cells.values() for x in values]
+            rng.shuffle(pool)
+            pos = 0
+            for regime in regimes:
+                n = len(cells.get(regime, ()))
+                for val in pool[pos:pos + n]:
+                    sample.append({"pair": pair, "block": block, "regime": regime, value: val})
+                pos += n
+        d = contrast(sample, plus, minus, value)
+        if d is not None:
+            draws.append(d)
+    if est is None or not draws:
+        p = None
+    else:
+        p = (1 + sum(abs(d) >= abs(est) for d in draws)) / (len(draws) + 1)
+    return {"estimate": est, "p_value": p, "draws": draws, "reps": len(draws)}
 
 
 def missing_bounds(summ, plus, minus) -> Dict:
@@ -273,17 +388,6 @@ def wilson_interval(successes: int, n: int, z: float = 1.959963984540054) -> Tup
     return max(0.0, (center - margin) / denom), min(1.0, (center + margin) / denom)
 
 
-def bootstrap_two_sided_p(draws: List[float]) -> Optional[float]:
-    """Two-sided bootstrap p-value from percentile-bootstrap draws of a contrast: 2 * min(share <= 0,
-    share >= 0), capped at 1 (Appendix D; edit-plan P3 item 14; supervisor-notes G-04)."""
-    if not draws:
-        return None
-    n = len(draws)
-    share_le0 = sum(1 for d in draws if d <= 0) / n
-    share_ge0 = sum(1 for d in draws if d >= 0) / n
-    return min(1.0, 2 * min(share_le0, share_ge0))
-
-
 def benjamini_hochberg(pvalues):
     """Benjamini-Hochberg q-values. Accepts a list (returns a list in the same order) or a dict (returns a
     dict with the same keys); q-values are monotone non-decreasing from the largest p-value down (Appendix
@@ -310,19 +414,32 @@ def benjamini_hochberg(pvalues):
 
 def secondary_family_bh(summ: List[Dict], value: str = "mean_surplus") -> Dict[str, Dict]:
     """Exploratory secondary family (edit-plan P3 item 14; supervisor-notes G-04): pair-specific D1-D0
-    effects, the interaction contrast, and the D0-S / D1-S descriptive contrasts. Two-sided bootstrap
-    p-values per member, then one shared Benjamini-Hochberg pass. Labelled exploratory throughout; never
+    effects, six group strata, and three descriptive contrasts. Sharp-null randomization
+    p-values for eligible members, then one shared Benjamini-Hochberg pass. Labelled exploratory throughout; never
     used in place of the pre-registered primary contrast."""
     pairs = sorted({s["pair"] for s in summ})
     members = {}
     for p in pairs:
         members["D1_minus_D0_" + p] = bootstrap([s for s in summ if s["pair"] == p], ["D1"], ["D0"], value)
+    # Six pre-specified group-pair strata are part of the exploratory family.
+    for group in C.GROUP_PAIR_STRATA:
+        members["D1_minus_D0_group_" + group] = bootstrap(
+            [s for s in summ if group_pair_stratum(s["pair"]) == group], ["D1"], ["D0"], value)
     members["interaction"] = bootstrap(summ, ["D1", "U0"], ["D0", "U1"], value)
     members["D0_minus_S"] = bootstrap(summ, ["D0"], ["S"], value)
     members["D1_minus_S"] = bootstrap(summ, ["D1"], ["S"], value)
-    pvals = {name: bootstrap_two_sided_p(bs["draws"]) for name, bs in members.items()}
-    qvals = benjamini_hochberg({k: v for k, v in pvals.items() if v is not None})
-    return {name: {"estimate": members[name]["estimate"], "p_value": pvals[name], "q_value": qvals.get(name)}
+    pvals = {name: bs.get("p_value") for name, bs in members.items()}
+    # The four-regime permutation tests a stronger sharp null than the
+    # factorial interaction. D0/S and D1/S also have different episode
+    # aggregation, so report all three as descriptive with no p-value.
+    pvals["interaction"] = None
+    pvals["D0_minus_S"] = None
+    pvals["D1_minus_S"] = None
+    qvals = benjamini_hochberg({k: v if v is not None else 1.0 for k, v in pvals.items()})
+    return {name: {"estimate": members[name]["estimate"], "ci_low": members[name].get("ci_low"),
+                   "ci_high": members[name].get("ci_high"), "p_value": pvals[name], "q_value": qvals.get(name) if pvals[name] is not None else None,
+                   "p_value_method": "descriptive_only" if name in ("interaction", "D0_minus_S", "D1_minus_S")
+                   else "within_pair_block_randomization"}
             for name in members}
 
 
@@ -375,6 +492,35 @@ def bootstrap_coverage(sd: float = 10.0, n_per_cell: int = C.MAIN_RUNS_PER_CELL,
     return covered / sims if sims else 0.0
 
 
+def clustered_rate_interval(rows: List[Dict], field: str, reps: int = 2000,
+                            seed: int = C.BOOTSTRAP_SEED, alpha: float = 0.05) -> Tuple[Optional[float], Optional[float]]:
+    """Percentile interval for a repeated-episode rate, resampling whole runs.
+
+    Episodes in one trajectory share model context and are not independent
+    binomial trials.  A Wilson interval is therefore reserved for S (or other
+    genuinely one-episode cells); repeated regimes use this run-clustered
+    interval.
+    """
+    by_run = defaultdict(list)
+    for row in rows:
+        if row.get(field) is not None:
+            by_run[row["run_id"]].append(row[field])
+    clusters = [v for v in by_run.values() if v]
+    if not clusters:
+        return None, None
+    rng = random.Random(seed)
+    draws = []
+    for _ in range(reps):
+        sampled = [cluster for cluster in (rng.choice(clusters) for _ in clusters)]
+        vals = [v for cluster in sampled for v in cluster if v is not None]
+        if vals:
+            draws.append(sum(vals) / len(vals))
+    if not draws:
+        return None, None
+    draws.sort()
+    return draws[int(alpha / 2 * len(draws))], draws[min(len(draws) - 1, int((1 - alpha / 2) * len(draws)))]
+
+
 # ---------------------------------------------------------------- reports
 def secondary_by_cell(rows: List[Dict]) -> List[Dict]:
     """Cell-level descriptives, including Wilson 95% intervals for agreement/IR-agreement rates (edit-plan
@@ -388,8 +534,16 @@ def secondary_by_cell(rows: List[Dict]) -> List[Dict]:
         obs = [r for r in rs if not r["technical_missing"]]
         agr = [r for r in obs if r["agreement"]]
         n_obs = len(obs)
-        agr_lo, agr_hi = wilson_interval(sum(r["agreement"] for r in obs), n_obs) if n_obs else (None, None)
-        ir_lo, ir_hi = wilson_interval(sum(r["ir_agreement"] for r in obs), n_obs) if n_obs else (None, None)
+        if n_obs and regime == "S":
+            agr_lo, agr_hi = wilson_interval(sum(r["agreement"] for r in obs), n_obs)
+            ir_lo, ir_hi = wilson_interval(sum(r["ir_agreement"] for r in obs), n_obs)
+            agr_cluster = ir_cluster = (None, None)
+        else:
+            agr_lo = agr_hi = ir_lo = ir_hi = None
+            seed_key = "{}|{}|{}".format(pair, regime, ep)
+            seed_int = int(hashlib.sha256(seed_key.encode()).hexdigest()[:8], 16)
+            agr_cluster = clustered_rate_interval(rs, "agreement", seed=seed_int)
+            ir_cluster = clustered_rate_interval(rs, "ir_agreement", seed=seed_int + 1)
         repeats = [r["prior_package_repeat"] for r in obs if r.get("prior_package_repeat") is not None]
         anchor_pairs = [(r["first_offer_price"], r["final_accepted_price"]) for r in obs
                         if r.get("first_offer_price") is not None]
@@ -398,8 +552,10 @@ def secondary_by_cell(rows: List[Dict]) -> List[Dict]:
                     "technical_missing": len(rs) - len(obs),
                     "agreement_rate": _mean([r["agreement"] for r in obs]),
                     "agreement_wilson_lo": agr_lo, "agreement_wilson_hi": agr_hi,
+                    "agreement_cluster_lo": agr_cluster[0], "agreement_cluster_hi": agr_cluster[1],
                     "ir_agreement_rate": _mean([r["ir_agreement"] for r in obs]),
                     "ir_agreement_wilson_lo": ir_lo, "ir_agreement_wilson_hi": ir_hi,
+                    "ir_agreement_cluster_lo": ir_cluster[0], "ir_agreement_cluster_hi": ir_cluster[1],
                     "mean_surplus": _mean([r["joint_surplus"] for r in obs]),
                     "mean_buyer_utility": _mean([r["buyer_utility"] for r in obs]),
                     "mean_supplier_utility": _mean([r["supplier_utility"] for r in obs]),
@@ -462,33 +618,129 @@ def illustration_sample(summ: List[Dict], seed=C.ILLUSTRATION_SEED) -> Dict[str,
     return {"{}|{}".format(*k): rng.choice(sorted(v)) for k, v in sorted(cells.items())}
 
 
-def full_report(episodes: List[Dict]) -> Dict:
+def synthetic_calibration(seed: int = C.BOOTSTRAP_SEED, n_per_cell: int = C.MAIN_RUNS_PER_CELL,
+                          reps: int = 500, missing_rate: float = 0.10) -> Dict:
+    """Deterministic, paid-call-free calibration of the estimators.
+
+    The generated values are synthetic normal trajectory summaries.  A null
+    contrast and a known five-unit effect are checked, followed by an explicit
+    technical-missingness bound example.  This validates estimator wiring; it
+    is not a pilot result and must never be mixed into a report.
+    """
+    if n_per_cell < len(C.BLOCKS) or n_per_cell % len(C.BLOCKS):
+        raise ValueError("n_per_cell must be a positive multiple of the four blocks")
+    rng = random.Random(seed)
+
+    def make(effect: float, missing: bool = False):
+        rows = []
+        per_block = n_per_cell // len(C.BLOCKS)
+        for b in range(len(C.BLOCKS)):
+            for r in range(per_block):
+                rid = "synthetic-{}-{}-{}".format(effect, b, r)
+                for regime, mu in (("D0", 20.0), ("D1", 20.0 + effect)):
+                    val = rng.gauss(mu, 10.0)
+                    if missing and regime == "D1" and rng.random() < missing_rate:
+                        continue
+                    rows.append({"run_id": rid + "-" + regime, "pair": "synthetic|synthetic",
+                                 "block": b, "regime": regime, "component": "synthetic",
+                                 "mean_surplus": val})
+        return rows
+
+    null_rows = make(0.0)
+    effect_rows = make(5.0)
+    null_bs = bootstrap(null_rows, ["D1"], ["D0"], reps=reps, seed=seed + 1)
+    effect_bs = bootstrap(effect_rows, ["D1"], ["D0"], reps=reps, seed=seed + 2)
+    missing_rows = make(5.0, missing=True)
+    missing_bs = bootstrap(missing_rows, ["D1"], ["D0"], reps=reps, seed=seed + 3)
+    # Run-level summaries above have deliberately unique run ids by condition;
+    # use the normal bound helper only on a small explicit technical-missing row
+    # to make the sensitivity check visible to callers.
+    bound_example = [{"run_id": "missing-d1", "pair": "synthetic|synthetic", "block": 0,
+                      "regime": "D1", "mean_surplus": None, "bound_low": -10.0, "bound_high": 50.0,
+                      "complete": False},
+                     {"run_id": "observed-d0", "pair": "synthetic|synthetic", "block": 0,
+                      "regime": "D0", "mean_surplus": 20.0, "bound_low": 20.0, "bound_high": 20.0,
+                      "complete": True}]
+    bounds = missing_bounds(bound_example, ["D1"], ["D0"])
+    # Repeated experiments quantify Monte Carlo uncertainty; a single interval
+    # missing its target is not itself evidence of a software error.
+    trials = 100
+    rejected, covered = 0, 0
+    for trial in range(trials):
+        nb = bootstrap(make(0.0), ["D1"], ["D0"], reps=reps, seed=seed + 100 + 2 * trial)
+        eb = bootstrap(make(5.0), ["D1"], ["D0"], reps=reps, seed=seed + 101 + 2 * trial)
+        rejected += nb["p_value"] <= .05
+        covered += eb["ci_low"] <= 5 <= eb["ci_high"]
+    monte_carlo = {"trials": trials, "null_rejection_rate": rejected / trials,
+                   "null_rejection_mc_interval": wilson_interval(rejected, trials),
+                   "effect_interval_coverage": covered / trials,
+                   "coverage_mc_interval": wilson_interval(covered, trials),
+                   "scope": "Independent normal trajectory summaries, SD 10; diagnostic only, not model power."}
+    return {"synthetic": True, "paid_calls": 0, "seed": seed, "n_per_cell": n_per_cell,
+            "reps": reps, "monte_carlo": monte_carlo, "known_null": {"true_effect": 0.0, "estimate": null_bs["estimate"],
+                                           "p_value": null_bs["p_value"]},
+            "known_effect": {"true_effect": 5.0, "estimate": effect_bs["estimate"],
+                              "ci_low": effect_bs["ci_low"], "ci_high": effect_bs["ci_high"],
+                              "ci_contains_truth": effect_bs["ci_low"] <= 5.0 <= effect_bs["ci_high"]},
+            "missingness_example": {"missing_rate": missing_rate, "bounds": bounds,
+                                     "available_case": missing_bs["estimate"]}}
+
+
+def full_report(episodes: List[Dict], scheduled_runs: Optional[Sequence] = None) -> Dict:
     """Confirmatory report. Restricted to component in (main, extension): placebo_pilot and paraphrase_pilot
     (and pilot/robustness_pilot/feasibility) never enter this report, even if passed in by mistake — they
     surface only through pilot_gate and the pilot-batch outputs (edit-plan-2026-09-15.md P3 items 10 & 12)."""
     episodes = [e for e in episodes if e["component"] in ("main", "extension")]
     rows = episode_table(episodes)
     main_rows = [r for r in rows if r["component"] == "main"]
-    summ = run_summaries(main_rows)
+    planned_main = [r for r in (scheduled_runs or ())
+                    if (r.get("component") if isinstance(r, dict) else r.component) == "main"]
+    summ = run_summaries(main_rows, scheduled_runs=planned_main or None)
     ext = run_summaries([r for r in rows if r["component"] == "extension"])
+    observed_main = [r for r in main_rows if not r["technical_missing"]]
+    missing_by_regime = {}
+    for regime in C.REGIMES:
+        eligible = [s for s in summ if s["regime"] == regime]
+        missing_by_regime[regime] = {
+            "scheduled_runs": len(eligible),
+            "complete_runs": sum(s["complete"] for s in eligible),
+            "incomplete_runs": sum(not s["complete"] for s in eligible),
+            "missing_episodes": sum(s["technical_missing_episodes"] for s in eligible),
+        }
+    interaction = bootstrap(summ, ["D1", "U0"], ["D0", "U1"])
+    interaction["p_value"] = None
+    interaction["p_value_method"] = "descriptive_only"
+    d0_s = bootstrap(summ, ["D0"], ["S"])
+    d0_s["p_value"] = None
+    d0_s["p_value_method"] = "descriptive_only"
+    d1_s = bootstrap(summ, ["D1"], ["S"])
+    d1_s["p_value"] = None
+    d1_s["p_value_method"] = "descriptive_only"
     return {
-        "counts": {"episodes": len(rows), "main_runs": len(summ), "extension_runs": len(ext)},
+        "counts": {"episodes": len(rows), "main_runs": len(summ), "extension_runs": len(ext),
+                   "observed_main_episodes": len(observed_main),
+                   "technical_missing_episodes": sum(r["technical_missing"] for r in rows),
+                   "disagreement_episodes": sum(r["outcome"] == "DISAGREEMENT" for r in rows),
+                   "agreement_episodes": sum(r["outcome"] == "AGREEMENT" for r in rows)},
         "primary_D1_minus_D0": bootstrap(summ, ["D1"], ["D0"]),
         "primary_bounds": missing_bounds(summ, ["D1"], ["D0"]),
         "primary_by_pair": pair_contrasts(summ, ["D1"], ["D0"]),
-        "interaction_(D1-D0)-(U1-U0)": bootstrap(summ, ["D1", "U0"], ["D0", "U1"]),
-        "descriptive_D0_minus_S": bootstrap(summ, ["D0"], ["S"]),
-        "descriptive_D1_minus_S": bootstrap(summ, ["D1"], ["S"]),
+        "primary_group_pair_stratified": group_pair_contrasts(summ, ["D1"], ["D0"]),
+        "missingness_by_regime": missing_by_regime,
+        "interaction_(D1-D0)-(U1-U0)": interaction,
+        "descriptive_D0_minus_S": d0_s,
+        "descriptive_D1_minus_S": d1_s,
         "agreement_D1_minus_D0": contrast(summ, ["D1"], ["D0"], "agreement_rate"),
         "extension_D1_descriptive": {s["pair"]: _mean([x["mean_surplus"] for x in ext if x["pair"] == s["pair"]])
                                      for s in ext},
         "se_multiplier_n24": standard_error_multiplier(),
         "mde_a_priori_sd_units": mde_sd_units(),
         "secondary_family_bh": secondary_family_bh(summ),
+        "secondary_family_size": len({s["pair"] for s in summ}) + len(C.GROUP_PAIR_STRATA) + 3,
         "prior_package_repeat_by_cell": prior_package_repeat_by_cell(main_rows),
         "first_offer_anchoring_by_cell": anchoring_by_cell(main_rows),
         "illustrations": illustration_sample(summ),
-        "caveat": "Configuration effects for archived models and one synthetic case; exploratory secondaries.",
+        "caveat": "Model API identifiers require feasibility verification; estimates describe this fixed case and exploratory secondaries.",
     }
 
 
